@@ -1,62 +1,77 @@
 #!/usr/bin/env python3
 """
-Business Times (Energy & Commodities) scraper using Playwright.
+Business Times (Energy & Commodities) scraper — sitemap-based.
 
-What it does:
-- Opens the section page in a real browser context (JS-rendered, infinite scroll).
-- Scrolls to load older cards until we have enough unique articles AND we've crossed the 2-year cutoff.
-- Extracts title + summary from the listing cards.
-- Visits each article URL to extract published_at reliably (meta tag / JSON-LD / visible span).
-- Saves to JSONL.
+Instead of Playwright scroll, this script:
+1. Generates monthly sitemap URLs for the lookback window.
+2. Fetches each sitemap with requests (no browser needed).
+3. Filters URLs containing /companies-markets/energy-commodities/.
+4. Uses <lastmod> from the sitemap as published_at (no per-article fetches).
+5. Optionally fetches article HTML to get title + summary if not derivable
+   from the URL slug.
+6. Saves to the same JSONL format as the Playwright version.
 
-Install:
-  pip install playwright python-dateutil bs4 requests
-  playwright install chromium
-
-Run:
-  python scrape_bt_playwright.py
+Encoding fix (v2):
+- Force UTF-8 decoding on all responses via resp.encoding = "utf-8" so that
+  smart quotes and special characters (e.g. â, Â) are not mojibaked.
+- _clean_text() now re-encodes through UTF-8 to strip any remaining oddities.
 """
 
+import argparse
 import json
 import re
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Dict, List, Set
-from urllib.parse import urljoin
+from typing import Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
+from xml.etree import ElementTree as ET
 
+import requests
 from bs4 import BeautifulSoup
-from dateutil import parser as dateparser
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+# ── constants ────────────────────────────────────────────────────────────────
 
 BASE = "https://www.businesstimes.com.sg"
-SECTION_URL = "https://www.businesstimes.com.sg/companies-markets/energy-commodities"
+SITEMAP_PATTERN = "https://www.businesstimes.com.sg/sitemap/{year}/{month:02d}/feeds.xml"
+SECTION_PATH = "/companies-markets/energy-commodities/"
+DEFAULT_LOOKBACK_DAYS = 365 * 2
+DEFAULT_OUTPUT = "data/raw/news/bt_energy_commodities_2y_sitemap.jsonl"
 
-# Politeness / stability knobs
-SCROLL_PAUSE_SECONDS = 2.5          # wait after each scroll for XHR to populate cards
-ARTICLE_DELAY_SECONDS = 1.0         # delay between article visits
-MAX_SCROLLS = 200                   # hard cap
-MIN_PAGES_WORTH = 10                # "at least 10 pages" approximation (cards/page ~ 10)
-APPROX_CARDS_PER_PAGE = 10          # adjust if BT shows more/less
-TARGET_MIN_ITEMS = MIN_PAGES_WORTH * APPROX_CARDS_PER_PAGE
+REQUEST_TIMEOUT = 30           # seconds per HTTP request
+RETRY_COUNT = 3                # retries per failed request
+RETRY_BACKOFF = 2.0            # seconds between retries
+FETCH_ARTICLE_DETAILS = False  # set True to fetch title/summary from article HTML
+ARTICLE_DELAY = 0.5            # seconds between article fetches if enabled
 
-# Date handling
 SGT = timezone(timedelta(hours=8))
+NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
+
+# ── data model ───────────────────────────────────────────────────────────────
 
 @dataclass
 class Item:
     title: str
     summary: str
     url: str
-    published_at: Optional[str]  # UTC ISO8601
+    published_at: Optional[str]   # UTC ISO8601
     section: str
 
 
+# ── helpers ──────────────────────────────────────────────────────────────────
+
 def _clean_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+    # Re-encode through UTF-8 to drop any mojibake remnants, then normalise whitespace
+    s = (s or "").encode("utf-8", "ignore").decode("utf-8")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _normalize_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    path = parsed.path.rstrip("/") or "/"
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
 def _to_utc_iso(dt: datetime) -> str:
@@ -65,270 +80,280 @@ def _to_utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def _parse_published_at_from_article_html(html: str) -> Optional[str]:
-    """
-    Robust publish time extraction from article HTML.
-    Priority:
-      1) meta[name="article:published_time"] content="...+08:00"
-      2) JSON-LD datePublished (often Z)
-      3) span[data-testid="article-published-time"] "Published ... · 05:36 PM"
-    """
-    soup = BeautifulSoup(html, "html.parser")
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
-    # 1) Meta tag: article:published_time
-    meta = soup.select_one('meta[name="article:published_time"]')
-    if meta and meta.get("content"):
+
+def _slug_to_title(url: str) -> str:
+    """Best-effort title from URL slug when article fetch is disabled."""
+    slug = urlparse(url).path.rstrip("/").split("/")[-1]
+    return _clean_text(slug.replace("-", " ").title())
+
+
+def _get(url: str, retries: int = RETRY_COUNT, timeout: int = REQUEST_TIMEOUT) -> Optional[requests.Response]:
+    for attempt in range(1, retries + 1):
         try:
-            dt = dateparser.parse(meta["content"])
-            return _to_utc_iso(dt)
-        except Exception:
-            pass
-
-    # 2) JSON-LD: datePublished
-    for s in soup.select('script[type="application/ld+json"]'):
-        txt = s.string or s.get_text(strip=True)
-        if not txt:
-            continue
-        try:
-            data = json.loads(txt)
-        except Exception:
-            continue
-
-        def _walk(obj):
-            if isinstance(obj, dict):
-                if obj.get("datePublished"):
-                    return obj["datePublished"]
-                for v in obj.values():
-                    found = _walk(v)
-                    if found:
-                        return found
-            elif isinstance(obj, list):
-                for it in obj:
-                    found = _walk(it)
-                    if found:
-                        return found
-            return None
-
-        date_pub = _walk(data)
-        if date_pub:
-            try:
-                dt = dateparser.parse(date_pub)
-                return _to_utc_iso(dt)
-            except Exception:
-                pass
-
-    # 3) Visible span
-    span = soup.select_one('span[data-testid="article-published-time"]')
-    if span:
-        txt = _clean_text(span.get_text(" ", strip=True))
-        if txt:
-            txt = re.sub(r"^\s*Published\s*", "", txt, flags=re.IGNORECASE).strip()
-            try:
-                dt = dateparser.parse(txt, dayfirst=False)
-                return _to_utc_iso(dt)
-            except Exception:
-                pass
-
+            resp = requests.get(
+                url,
+                timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            # Always force UTF-8 — don't trust the server's Content-Type charset,
+            # which is often wrong and causes smart quotes to appear as â / Â garbage.
+            resp.encoding = "utf-8"
+            if resp.status_code < 400:
+                return resp
+            print(f"  HTTP {resp.status_code} for {url}")
+        except Exception as e:
+            print(f"  Request error ({attempt}/{retries}): {e}")
+        if attempt < retries:
+            time.sleep(RETRY_BACKOFF * attempt)
     return None
 
 
-def _project_path(*parts: str) -> str:
+def _fetch_article_details(url: str) -> tuple[str, str]:
+    """Fetch title and first paragraph from article HTML."""
+    resp = _get(url)
+    if not resp:
+        return _slug_to_title(url), ""
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Title — prefer og:title meta, fall back to h1
+    title = ""
+    og = soup.select_one('meta[property="og:title"]')
+    if og and og.get("content"):
+        title = _clean_text(og["content"])
+    if not title:
+        tag = soup.find("h1")
+        if tag:
+            title = _clean_text(tag.get_text(" "))
+    if not title:
+        title = _slug_to_title(url)
+
+    # Summary — first substantial paragraph in article body
+    summary = ""
+    for p in soup.select("article p, [data-testid='article-body'] p"):
+        txt = _clean_text(p.get_text(" "))
+        if txt and len(txt) > 40:
+            summary = txt
+            break
+
+    return title, summary
+
+
+def _monthly_sitemap_urls(lookback_days: int) -> List[str]:
+    """Generate sitemap URLs for every month in the lookback window."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=lookback_days)
+    urls = []
+    cur = now.replace(day=1)
+    while cur >= cutoff.replace(day=1):
+        urls.append(SITEMAP_PATTERN.format(year=cur.year, month=cur.month))
+        if cur.month == 1:
+            cur = cur.replace(year=cur.year - 1, month=12)
+        else:
+            cur = cur.replace(month=cur.month - 1)
+    return urls
+
+
+def _parse_sitemap(xml_text: str, cutoff: datetime) -> List[tuple[str, str]]:
     """
-    Resolve path relative to repo root by finding README.md or .git.
-    Falls back to script directory.
+    Parse a monthly sitemap XML and return (url, lastmod) pairs for
+    energy-commodities articles within the cutoff window.
     """
-    here = Path(__file__).resolve()
-    cur = here.parent
-    for _ in range(10):
-        if (cur / "README.md").exists() or (cur / ".git").exists():
-            return str((cur.joinpath(*parts)).resolve())
-        cur = cur.parent
-    return str((here.parent.joinpath(*parts)).resolve())
+    results = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        print(f"  XML parse error: {e}")
+        return results
+
+    for url_el in root.findall("sm:url", NS):
+        loc = url_el.findtext("sm:loc", "", NS).strip()
+        lastmod = url_el.findtext("sm:lastmod", "", NS).strip()
+
+        if SECTION_PATH not in loc:
+            continue
+
+        dt = _parse_iso_datetime(lastmod)
+        if dt and dt < cutoff:
+            continue
+
+        results.append((_normalize_url(loc), lastmod))
+
+    return results
+
+
+# ── main scrape ──────────────────────────────────────────────────────────────
+
+def scrape(
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    fetch_article_details: bool = FETCH_ARTICLE_DETAILS,
+    article_delay: float = ARTICLE_DELAY,
+    existing_by_url: Optional[Dict[str, Item]] = None,
+) -> List[Item]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    existing_by_url = existing_by_url or {}
+    seen: Dict[str, str] = {}   # url -> lastmod
+
+    sitemap_urls = _monthly_sitemap_urls(lookback_days)
+    print(f"Fetching {len(sitemap_urls)} monthly sitemaps "
+          f"(cutoff: {cutoff.date().isoformat()})...")
+
+    for sm_url in sitemap_urls:
+        print(f"  {sm_url}", end=" ... ", flush=True)
+        resp = _get(sm_url)
+        if not resp:
+            print("FAILED")
+            continue
+        pairs = _parse_sitemap(resp.text, cutoff)
+        before = len(seen)
+        for url, lastmod in pairs:
+            if url not in seen:
+                seen[url] = lastmod
+        print(f"{len(pairs)} energy articles (+{len(seen) - before} new)")
+
+    print(f"\nTotal unique energy-commodities URLs: {len(seen)}")
+
+    # ── build Item list ───────────────────────────────────────────────────────
+    items: List[Item] = []
+    for idx, (url, lastmod) in enumerate(seen.items(), start=1):
+        published_at = None
+        dt = _parse_iso_datetime(lastmod)
+        if dt:
+            published_at = _to_utc_iso(dt)
+
+        # Try cache first
+        cached = existing_by_url.get(url)
+        if cached:
+            title = cached.title or _slug_to_title(url)
+            summary = cached.summary or ""
+        elif fetch_article_details:
+            title, summary = _fetch_article_details(url)
+            if article_delay > 0:
+                time.sleep(article_delay)
+        else:
+            title = _slug_to_title(url)
+            summary = ""
+
+        items.append(Item(
+            title=title,
+            summary=summary,
+            url=url,
+            published_at=published_at,
+            section="Energy & Commodities",
+        ))
+
+        if idx % 100 == 0 or idx == len(seen):
+            print(f"  Built {idx}/{len(seen)} items")
+
+    # Sort newest first
+    items.sort(
+        key=lambda it: _parse_iso_datetime(it.published_at) or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return items
+
+
+# ── persistence ───────────────────────────────────────────────────────────────
+
+def _load_existing(path: str) -> Dict[str, Item]:
+    out = Path(path)
+    if not out.exists():
+        return {}
+    index: Dict[str, Item] = {}
+    with out.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            url = _normalize_url(raw.get("url", ""))
+            if not url:
+                continue
+            index[url] = Item(
+                title=_clean_text(raw.get("title", "")),
+                summary=_clean_text(raw.get("summary", "")),
+                url=url,
+                published_at=raw.get("published_at"),
+                section=raw.get("section", "Energy & Commodities"),
+            )
+    return index
 
 
 def _save_jsonl(items: List[Item], path: str) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as f:
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         for it in items:
             f.write(json.dumps(asdict(it), ensure_ascii=False) + "\n")
+    tmp.replace(out)
+    print(f"Saved {len(items)} items -> {out}")
 
 
-def _extract_cards_from_dom(page) -> Dict[str, Item]:
-    """
-    Extract card title/summary/url from the SECTION page DOM.
-    Returns dict keyed by URL.
-    """
-    cards: Dict[str, Item] = {}
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-    # BT uses stable data-testid for card titles.
-    # We locate anchors, then look upward for summary text within the card container.
-    anchors = page.locator('h3[data-testid="card-title-component"] a')
-    count = anchors.count()
-    if count == 0:
-        # fallback
-        anchors = page.locator("h3 a")
-        count = anchors.count()
-
-    for i in range(count):
-        a = anchors.nth(i)
-        href = a.get_attribute("href")
-        title = _clean_text(a.inner_text() or "")
-        if not href or not title:
-            continue
-
-        url = urljoin(BASE, href)
-
-        # Try to find a summary near the card.
-        # We'll climb to a reasonable ancestor and look for a paragraph.
-        summary = ""
-        try:
-            # Find the nearest ancestor that likely represents a card
-            container = a.locator("xpath=ancestor::*[self::article or self::li or self::div or self::section][1]")
-            p = container.locator("p").first
-            if p.count():
-                summary = _clean_text(p.inner_text() or "")
-        except Exception:
-            summary = ""
-
-        cards[url] = Item(
-            title=title,
-            summary=summary,
-            url=url,
-            published_at=None,
-            section="Energy & Commodities",
-        )
-
-    return cards
+def _project_path(*parts: str) -> str:
+    here = Path(__file__).resolve()
+    cur = here.parent
+    for _ in range(10):
+        if (cur / "README.md").exists() or (cur / ".git").exists():
+            return str(cur.joinpath(*parts).resolve())
+        cur = cur.parent
+    return str(here.parent.joinpath(*parts).resolve())
 
 
-def scrape_bt_energy_commodities_two_years(
-    min_items: int = TARGET_MIN_ITEMS,
-    max_scrolls: int = MAX_SCROLLS,
-    scroll_pause_seconds: float = SCROLL_PAUSE_SECONDS,
-    article_delay_seconds: float = ARTICLE_DELAY_SECONDS,
-    headless: bool = True,
-) -> List[Item]:
-    """
-    Scroll-load cards until we have at least `min_items` unique URLs.
-    Then visit each article to populate published_at and filter to last 2 years.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=365 * 2)
-    seen: Dict[str, Item] = {}
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
-            ),
-            locale="en-SG",
-            timezone_id="Asia/Singapore",
-        )
-        page = context.new_page()
-
-        print("Opening:", SECTION_URL)
-        page.goto(SECTION_URL, wait_until="domcontentloaded", timeout=60000)
-
-        # Wait for initial cards
-        try:
-            page.wait_for_selector('h3[data-testid="card-title-component"] a', timeout=20000)
-        except PlaywrightTimeoutError:
-            # fallback selector
-            page.wait_for_selector("h3 a", timeout=20000)
-
-        last_count = 0
-        stagnant_scrolls = 0
-
-        for s in range(1, max_scrolls + 1):
-            cards = _extract_cards_from_dom(page)
-            before = len(seen)
-            seen.update(cards)
-            after = len(seen)
-
-            print(f"Scroll {s}/{max_scrolls}: unique_urls={after} (+{after - before})")
-
-            # Stop if we have enough items and we're not gaining much
-            if after >= min_items and (after - before) == 0:
-                print(f"Reached min_items={min_items} and no new items on this scroll. Stopping scroll.")
-                break
-
-            # Detect stagnation
-            if after == last_count:
-                stagnant_scrolls += 1
-            else:
-                stagnant_scrolls = 0
-            last_count = after
-
-            if stagnant_scrolls >= 5 and after >= min_items:
-                print("Stagnant for 5 scrolls after reaching min_items. Stopping scroll.")
-                break
-            if stagnant_scrolls >= 10:
-                print("Stagnant for 10 scrolls. Stopping scroll.")
-                break
-
-            # Scroll down
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(scroll_pause_seconds)
-
-        # Now visit articles to fetch published_at and apply 2-year cutoff.
-        results: List[Item] = []
-        urls = list(seen.keys())
-        print("Visiting articles for timestamps:", len(urls))
-
-        for idx, url in enumerate(urls, start=1):
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                html = page.content()
-                published_at = _parse_published_at_from_article_html(html)
-            except PlaywrightTimeoutError:
-                print("TIMEOUT:", url)
-                continue
-            except Exception as e:
-                print("ERROR:", url, repr(e))
-                continue
-
-            it = seen[url]
-            it.published_at = published_at
-
-            # Filter by cutoff if we have a date
-            if published_at:
-                dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-                if dt < cutoff:
-                    # older than 2 years
-                    pass
-                else:
-                    results.append(it)
-            else:
-                # If date missing, keep (or drop—your choice). Keeping can help debugging.
-                results.append(it)
-
-            if idx % 25 == 0:
-                print(f"Processed {idx}/{len(urls)}; kept={len(results)}")
-
-            time.sleep(article_delay_seconds)
-
-        browser.close()
-
-    # Sort newest first if published_at exists
-    def _sort_key(x: Item):
-        if not x.published_at:
-            return datetime(1970, 1, 1, tzinfo=timezone.utc)
-        return datetime.fromisoformat(x.published_at.replace("Z", "+00:00"))
-
-    results.sort(key=_sort_key, reverse=True)
-    return results
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape BT Energy & Commodities via monthly sitemaps into JSONL."
+    )
+    parser.add_argument(
+        "--output",
+        default=_project_path("data", "raw", "news", "bt_energy_commodities_2y_sitemap.jsonl"),
+        help="Output JSONL path.",
+    )
+    parser.add_argument(
+        "--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
+        help=f"How many days back to collect. (default: {DEFAULT_LOOKBACK_DAYS})",
+    )
+    parser.add_argument(
+        "--fetch-details", action="store_true", default=False,
+        help="Fetch each article page to get proper title and summary (slow but richer).",
+    )
+    parser.add_argument(
+        "--article-delay", type=float, default=ARTICLE_DELAY,
+        help=f"Seconds between article fetches when --fetch-details is on. (default: {ARTICLE_DELAY})",
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Do not load existing output as cache for titles/summaries.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    data = scrape_bt_energy_commodities_two_years(
-        min_items=TARGET_MIN_ITEMS,   # ~10 pages worth
-        max_scrolls=200,
-        scroll_pause_seconds=2.5,
-        article_delay_seconds=1.0,
-        headless=True,                # set False to watch it scroll
+    args = _parse_args()
+
+    existing = {}
+    if not args.no_cache:
+        existing = _load_existing(args.output)
+        print(f"Loaded {len(existing)} cached entries from {args.output}")
+
+    data = scrape(
+        lookback_days=args.lookback_days,
+        fetch_article_details=args.fetch_details,
+        article_delay=args.article_delay,
+        existing_by_url=existing,
     )
-    out_path = _project_path("data", "raw", "news", "_checkbt_energy_commodities_2y_playwright.jsonl")
-    _save_jsonl(data, out_path)
-    print("Done:", len(data), "->", out_path)
+    _save_jsonl(data, args.output)
+    print(f"Done: {len(data)} articles")
