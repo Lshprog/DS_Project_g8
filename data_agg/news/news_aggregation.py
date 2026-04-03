@@ -5,16 +5,21 @@ Business Times (Energy & Commodities) scraper — sitemap-based.
 Instead of Playwright scroll, this script:
 1. Generates monthly sitemap URLs for the lookback window.
 2. Fetches each sitemap with requests (no browser needed).
-3. Filters URLs containing /companies-markets/energy-commodities/.
+3. Filters URLs by energy/commodities keywords in the slug — not just the
+   /companies-markets/energy-commodities/ path — so articles filed under
+   /international/, /opinion-features/, /singapore/ etc. are also captured.
 4. Uses <lastmod> from the sitemap as published_at (no per-article fetches).
-5. Optionally fetches article HTML to get title + summary if not derivable
-   from the URL slug.
+5. Optionally fetches article HTML to get title + summary.
 6. Saves to the same JSONL format as the Playwright version.
 
 Encoding fix (v2):
-- Force UTF-8 decoding on all responses via resp.encoding = "utf-8" so that
-  smart quotes and special characters (e.g. â, Â) are not mojibaked.
-- _clean_text() now re-encodes through UTF-8 to strip any remaining oddities.
+- Force UTF-8 decoding on all responses via resp.encoding = "utf-8".
+- _clean_text() re-encodes through UTF-8 to strip mojibake remnants.
+
+Keyword filter fix (v3):
+- Replaced strict path filter (/companies-markets/energy-commodities/) with
+  a broad keyword regex matched against the URL slug, capturing articles filed
+  under /international/, /opinion-features/, /singapore/, etc.
 """
 
 import argparse
@@ -35,15 +40,25 @@ from bs4 import BeautifulSoup
 
 BASE = "https://www.businesstimes.com.sg"
 SITEMAP_PATTERN = "https://www.businesstimes.com.sg/sitemap/{year}/{month:02d}/feeds.xml"
-SECTION_PATH = "/companies-markets/energy-commodities/"
 DEFAULT_LOOKBACK_DAYS = 365 * 2
-DEFAULT_OUTPUT = "data/raw/news/bt_energy_commodities_2y_sitemap.jsonl"
 
 REQUEST_TIMEOUT = 30           # seconds per HTTP request
 RETRY_COUNT = 3                # retries per failed request
 RETRY_BACKOFF = 2.0            # seconds between retries
 FETCH_ARTICLE_DETAILS = False  # set True to fetch title/summary from article HTML
 ARTICLE_DELAY = 0.5            # seconds between article fetches if enabled
+
+# Keyword regex matched against the URL slug/path.
+# Catches energy & commodities articles regardless of which section they are
+# filed under (/international/, /opinion-features/, /singapore/, etc.).
+ENERGY_KEYWORDS = re.compile(
+    r"oil|gas|lng|crude|petrol|fuel|energy|gold|silver|coal|"
+    r"commodit|copper|nickel|alumin|lithium|uranium|opec|aramco|"
+    r"petronas|pertamina|sinopec|refin|barrel|hormuz|brent|wti|"
+    r"naphtha|kerosene|diesel|palm.oil|natural.gas|shale|offshore|"
+    r"rig|pipeline|tanker|refinery|downstream|upstream|midstream",
+    re.IGNORECASE,
+)
 
 SGT = timezone(timedelta(hours=8))
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -63,7 +78,7 @@ class Item:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _clean_text(s: str) -> str:
-    # Re-encode through UTF-8 to drop any mojibake remnants, then normalise whitespace
+    # Re-encode through UTF-8 to drop mojibake remnants, then normalise whitespace
     s = (s or "").encode("utf-8", "ignore").decode("utf-8")
     return re.sub(r"\s+", " ", s).strip()
 
@@ -162,10 +177,17 @@ def _monthly_sitemap_urls(lookback_days: int) -> List[str]:
     return urls
 
 
+def _is_energy_url(url: str) -> bool:
+    """Return True if the URL slug contains an energy/commodities keyword."""
+    path = urlparse(url).path
+    return bool(ENERGY_KEYWORDS.search(path))
+
+
 def _parse_sitemap(xml_text: str, cutoff: datetime) -> List[tuple[str, str]]:
     """
     Parse a monthly sitemap XML and return (url, lastmod) pairs for
-    energy-commodities articles within the cutoff window.
+    energy/commodities articles within the cutoff window.
+    Matches on URL slug keywords rather than a strict section path.
     """
     results = []
     try:
@@ -178,7 +200,7 @@ def _parse_sitemap(xml_text: str, cutoff: datetime) -> List[tuple[str, str]]:
         loc = url_el.findtext("sm:loc", "", NS).strip()
         lastmod = url_el.findtext("sm:lastmod", "", NS).strip()
 
-        if SECTION_PATH not in loc:
+        if not _is_energy_url(loc):
             continue
 
         dt = _parse_iso_datetime(lastmod)
