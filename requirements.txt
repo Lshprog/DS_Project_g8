@@ -1,0 +1,7 @@
+# Pin torch: 2.11 + Jupyter hits TorchDynamo import errors (trace_rules / torch._utils).
+torch==2.5.1
+numpy
+pandas
+scikit-learn
+matplotlib
+ipykernel
